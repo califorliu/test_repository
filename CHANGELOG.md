@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.2.0] - 2026-10-10
+
+### Added
+- Repository policy notes and documentation refresh for the 1.2.0 line.
+
 ## [1.1.0] - 2026-10-10
 
 ### Added
