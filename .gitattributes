@@ -1,0 +1,39 @@
+# 统一行尾与文本/二进制识别。
+#
+# 作用：不同平台（Windows / macOS / Linux）克隆后不会因为 CRLF 与 LF 的差异
+# 产生整文件重排的 diff，也让二进制文件不被当成文本处理。
+#
+# 建议本地执行一次：
+#   git config core.autocrlf false
+
+# 默认：自动识别文本文件，仓库内统一存 LF
+* text=auto eol=lf
+
+# 明确的二进制类型
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.bmp   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.tar   binary
+*.7z    binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+
+# Windows 批处理脚本必须保留 CRLF，否则无法执行
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# 不要对 `.github/` 或本文件本身使用 export-ignore：
+#   - 排除 `.github/`：本仓库就再也拿不到 pr-guard.yml 与 PR 模板，
+#     分支保护里那三个必需状态检查永远不上报，合并会一直卡在 Expected；
+#   - 排除本文件：上面这些行尾规则会失效。
+#     （发布用的是 git archive + 镜像式复制，缺失的文件不会被补回来）。
+# 需要让某个路径不进公开仓库时，请在发布链路的上游处理，不要写在这个文件里。

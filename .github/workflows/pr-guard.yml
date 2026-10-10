@@ -1,0 +1,288 @@
+# =============================================================================
+# PR 守卫（自动闸门）
+# =============================================================================
+# 在 pull_request 事件上运行三道检查：
+#   1. 密钥扫描        —— 挡住误提交的密钥、令牌、凭据
+#   2. PR 标题 lint    —— 校验 Conventional Commits 格式
+#   3. 文件规范检查    —— 挡住本地环境文件、依赖目录、构建产物、大文件
+#
+# 这些检查只是「自动闸门」，用来在合并前挡住最明显的错误与风险。
+# 它们**不能替代维护者的逐行 review**：密钥扫描会漏报、标题 lint 只看标题、
+# 文件检查只看文件名与大小。是否合并最终仍由维护者逐行判断。
+#
+# 为什么必须在「合并之前」完成：
+#   PR 一旦打开，提交就已经公开了 —— 任何人都可以执行
+#     git fetch origin refs/pull/<N>/head
+#   把它拉到本地，也能在提交页面直接看到内容。所以「先合并、再补救」无效：
+#   敏感信息在合并前就已经外泄，事后删除提交无法收回。
+#   同理，本仓库只允许 squash 合并，PR 标题会直接成为 main 上的提交信息，
+#   因此标题必须在合并前就是规范的。
+#
+# 这些 job 是分支保护里「Require status checks」的来源：
+# 检查名 = 下面的 job 名称（密钥扫描 / PR 标题 lint / 文件规范检查）。
+# 请保持 job 名称稳定；一旦改名，需要同步更新分支保护配置与 CONTRIBUTING.md。
+# =============================================================================
+
+name: PR 守卫
+
+on:
+  pull_request:
+    # 加上 edited：修改 PR 标题后重新校验标题格式
+    types: [opened, synchronize, reopened, edited]
+
+# 最小权限：只需要读取仓库内容与 PR 信息
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. 密钥扫描：挡住误提交的密钥、令牌、凭据
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: 密钥扫描
+    runs-on: ubuntu-latest
+    # gitleaks-action 需要在 PR 上回写扫描结果，因此本 job 单独提升 pull-requests 权限；
+    # 其余 job 仍沿用顶层的只读权限。
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: 检出代码（完整历史）
+        uses: actions/checkout@v4
+        with:
+          # gitleaks 需要完整历史才能扫描 PR 引入的提交范围
+          fetch-depth: 0
+
+      - name: 运行 gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          # 必需：用于读取 PR 信息并在 PR 上报告扫描结果
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 可选：只有 GitHub 组织（Organization）账号需要 license。
+          # 个人账号可删除下面这行。若需要，请在仓库 Secrets 中添加 GITLEAKS_LICENSE。
+          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # ---------------------------------------------------------------------------
+  # 2. PR 标题 lint：校验 Conventional Commits 格式
+  # ---------------------------------------------------------------------------
+  pr-title-lint:
+    name: PR 标题 lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: 校验 PR 标题
+        # 只允许 squash 合并，所以 PR 标题就是 main 上最终提交信息的来源，
+        # 必须在合并前校验。允许的 type 与 CONTRIBUTING.md 中列出的一致。
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            refactor
+            test
+            chore
+            perf
+            build
+            ci
+            style
+            revert
+          # scope 可选：写成 feat(parser): ...
+          requireScope: false
+          # 描述部分不能以大写字母开头、结尾不能是句号
+          subjectPattern: "^(?![A-Z]).+[^.]$"
+          subjectPatternError: |
+            PR 标题的描述部分不符合要求：不要以大写字母开头，结尾不要加句号。
+            例如：feat(parser): 支持嵌套括号
+          # 禁止 WIP 标题通过检查
+          wip: false
+
+  # ---------------------------------------------------------------------------
+  # 3. 文件规范检查：挡住本地环境文件、依赖目录、构建产物、大文件
+  # ---------------------------------------------------------------------------
+  file-policy:
+    name: 文件规范检查
+    runs-on: ubuntu-latest
+    env:
+      # 禁止提交的「依赖目录 / 构建产物」模式（POSIX ERE，按「任意层级」匹配，
+      # 例如 src/dist/ 也会被拦下）。这一类**不接受任何白名单**。
+      FORBIDDEN_DIR_PATTERN: '(^|/)(node_modules|\.venv|venv|\.pnpm-store|dist|build|out|target|__pycache__|\.idea|\.vscode)/'
+      # 禁止提交的「本地环境文件 / 凭据」模式（POSIX ERE）。
+      # 覆盖 .env / .ENV / .env.local / prod.env / secret.env.example 等；
+      # 唯一例外是 basename 恰好为 .env.example 的占位文件（见下面的放行逻辑）。
+      FORBIDDEN_ENV_PATTERN: '(^|/)(\.env|[^/]*\.env)($|\.)'
+      # 禁止提交的「私钥 / 凭据配置 / 系统垃圾 / 日志」模式（同样按「任意层级」匹配）。
+      # 这一类**不接受任何白名单**（.env.example 只豁免上面那条环境文件规则）。
+      FORBIDDEN_FILE_PATTERN: '(^|/)id_(rsa|dsa|ecdsa|ed25519)|(^|/)(\.npmrc|\.pypirc|credentials\.json)(/|\.)|(^|/)(Thumbs\.db|\.DS_Store)/|\.(pem|key|pyc|log)/'
+      # 注意：这些模式里只有 FORBIDDEN_ENV_PATTERN 用行尾锚点 `$` —— 它按**完整路径**
+      # 匹配，故意不补 sentinel，好与钩子的 `grep -E` 写法逐字等价（补了 sentinel 会让
+      # `dir.env/file` 这类路径与钩子产生差异）。其余模式判定时会在路径末尾补一个 `/`
+      # （sentinel），因此 `(/|\.)` 这类写法已经足够，且不会被 git 输出的引号顶掉。
+      # 只包含与具体项目无关的通用规则；如需增删，请同步更新 CONTRIBUTING.md 的说明。
+      # 单个文件大小上限（MB）
+      MAX_FILE_MB: '5'
+    steps:
+      - name: 检出代码（完整历史）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 检查改动文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 路径匹配不区分大小写：.ENV / .Env / Thumbs.DB 都算命中
+          shopt -s nocasematch
+
+          BASE_REF="${{ github.base_ref }}"
+          echo "目标分支：${BASE_REF}"
+
+          # 取到目标分支，保证三点 diff 能算出合并基
+          git fetch --no-tags origin "${BASE_REF}"
+
+          # 本次 PR 新增/修改的文件列表（--diff-filter=d = 排除纯删除）。
+          # 纯删除不该判失败：删掉已经误提交的 .env / node_modules/ 正是本闸门
+          # 鼓励的清理动作（见 CONTRIBUTING.md 第 5 节）。
+          # 用 -z（NUL 分隔）而不是逐行读取：git 会给非 ASCII、含引号、含换行的路径
+          # 加上包裹双引号与八进制转义（例如 "big-\344\270\255\346\226\207.bin"），
+          # 那种「展示形态」既不能用于正则判定，也不能用于 git cat-file。
+          DIFF_FILE="$(mktemp)"
+          trap 'rm -f "$DIFF_FILE"' EXIT
+
+          # 进程替换 <(...) 的退出码不会被 mapfile 检查。这里先把结果落到临时文件，
+          # 显式检查退出码：拿不到改动列表时必须失败（fail closed），
+          # 绝不能把「diff 失败」当成「没有改动文件」而报绿。
+          if ! git diff --name-only -z --diff-filter=d "origin/${BASE_REF}...HEAD" > "$DIFF_FILE"; then
+            echo "::error::无法计算本 PR 相对 origin/${BASE_REF} 的改动文件列表（git diff 失败）。"
+            exit 1
+          fi
+
+          CHANGED=()
+          while IFS= read -r -d '' f || [ -n "$f" ]; do
+            CHANGED+=("$f")
+          done < "$DIFF_FILE"
+
+          if [ "${#CHANGED[@]}" -eq 0 ]; then
+            echo "本次 PR 没有新增或修改任何文件（可能只包含删除），检查通过。"
+            exit 0
+          fi
+
+          echo "本次 PR 改动的文件（共 ${#CHANGED[@]} 个）："
+          printf '  %s\n' "${CHANGED[@]}"
+
+          # --- 3.1 路径规范 -------------------------------------------------
+          # 禁止模式说明（见 job 顶部的 FORBIDDEN_*_PATTERN）：
+          #   .env / prod.env / secret.env.example   本地环境变量与凭据
+          #   node_modules/ 等    依赖目录（可由包管理器重建）
+          #   dist/ build/ 等     构建产物与缓存
+          #   id_rsa*、.npmrc 等  私钥与凭据配置
+          #   *.pem *.key *.pyc *.log   证书、私钥、编译产物与日志
+          #   编辑器/系统垃圾      .idea/、.DS_Store 等
+          # 目录 / 私钥 / 系统垃圾规则判定时在路径末尾补一个 "/"（sentinel），因此不依赖
+          # 行尾锚点 $；环境文件规则（FORBIDDEN_ENV_PATTERN）按完整路径匹配，带 $。
+          HITS=()
+          for f in "${CHANGED[@]}"; do
+            [ -z "$f" ] && continue
+            probe="${f}/"
+
+            # 依赖目录 / 构建产物：不接受任何白名单（.env.example 也不例外）
+            if [[ "$probe" =~ $FORBIDDEN_DIR_PATTERN ]]; then
+              HITS+=("$f")
+              continue
+            fi
+
+            # 显式放行：只含占位值的示例文件。
+            # 必须是「文件名恰好是 .env.example」，而不是任何以 .env.example 结尾的名字 ——
+            # 否则 node_modules/xxx.env.example 之类会绕过上面的目录规则。
+            # 这个豁免只作用于下面的环境文件规则，不作用于目录规则（那条判断在前）。
+            base="${f##*/}"
+            if [[ "$base" == ".env.example" ]]; then
+              continue
+            fi
+
+            # 本地环境文件：与 pre-push 钩子同一套规则，按**完整路径**匹配（无 sentinel），
+            # 因此 `$` 就是路径末尾。.env / .ENV / prod.env / secret.env.example 都在这里被拦下。
+            if [[ "$f" =~ $FORBIDDEN_ENV_PATTERN ]]; then
+              HITS+=("$f")
+              continue
+            fi
+
+            if [[ "$probe" =~ $FORBIDDEN_FILE_PATTERN ]]; then
+              HITS+=("$f")
+            fi
+          done
+
+          if [ "${#HITS[@]}" -gt 0 ]; then
+            echo ""
+            echo "::error::本 PR 包含不允许提交的文件，请从 PR 中移除下列文件："
+            for f in "${HITS[@]}"; do
+              echo "  - ${f}"
+            done
+            echo ""
+            echo "说明：本地环境文件、依赖目录、构建产物、私钥与系统垃圾文件不应进入仓库。"
+            echo "详见 CONTRIBUTING.md 的「不要提交哪些文件」一节。"
+            echo "如果你认为其中某个路径确实应当提交，请在 PR 描述中说明。"
+            exit 1
+          fi
+
+          # --- 3.2 文件大小 -------------------------------------------------
+          BIG=()
+          SIZE_ERROR=0
+          LIMIT=$(( MAX_FILE_MB * 1024 * 1024 ))
+          while IFS= read -r -d '' f || [ -n "$f" ]; do
+            [ -z "$f" ] && continue
+            # 取大小失败时必须判失败：把失败当成 0 字节会让该文件静默通过。
+            if ! size=$(git cat-file -s "HEAD:${f}" 2>/dev/null); then
+              echo "::error::无法读取 ${f} 的大小（git cat-file 失败）。"
+              SIZE_ERROR=1
+              continue
+            fi
+            if [ "$size" -gt "$LIMIT" ]; then
+              BIG+=("${f}  ($(( size / 1024 / 1024 )) MB)")
+            fi
+          done < "$DIFF_FILE"
+
+          if [ "$SIZE_ERROR" -ne 0 ]; then
+            echo ""
+            echo "读取文件大小时出错，按失败处理（fail closed）。"
+            exit 1
+          fi
+
+          if [ "${#BIG[@]}" -gt 0 ]; then
+            echo ""
+            echo "::error::本 PR 包含超过 ${MAX_FILE_MB} MB 的文件："
+            for f in "${BIG[@]}"; do
+              echo "  - ${f}"
+            done
+            echo ""
+            echo "大文件会永久留在仓库历史里，无法通过后续提交真正删除。"
+            echo "请改用外部存储、发布附件，或先开 issue 讨论（见 CONTRIBUTING.md）。"
+            exit 1
+          fi
+
+          echo ""
+          echo "文件规范检查通过：未命中禁止模式，也没有超大文件。"
+
+  # ---------------------------------------------------------------------------
+  # 4. 许可证检查（可选，默认关闭）
+  # ---------------------------------------------------------------------------
+  # 说明：许可证检查是「可选」的，请按项目实际许可证要求决定是否开启，
+  #      不要在不确认需求的情况下打开强制检查，否则会挡住正常贡献。
+  # 可选方案：
+  #   - licensee（https://github.com/licensee/licensee）：检查仓库整体许可证是否可识别；
+  #   - addlicense / reuse 等工具：检查源码文件是否带 SPDX 许可证头。
+  # 需要时取消下面的注释即可（不需要任何额外密钥）。
+  #
+  # license-check:
+  #   name: 许可证检查
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: 检出代码
+  #       uses: actions/checkout@v4
+  #
+  #     - name: 检查许可证（示例：licensee）
+  #       run: |
+  #         gem install licensee
+  #         licensee detect .
